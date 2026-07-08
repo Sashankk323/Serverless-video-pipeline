@@ -1,0 +1,64 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Video transcoding pipeline - Day 1: presigned-URL upload path.
+  Future days will add an S3 event trigger, Step Functions, transcode Lambdas,
+  an HLS output bucket, and CloudFront in front of it.
+
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Architectures: [arm64]
+    Timeout: 10
+    MemorySize: 128
+
+Resources:
+  # Dedicated bucket for raw (pre-transcode) uploads only. Keeping it separate
+  # from the future HLS output bucket means the two lifecycle/CORS/event
+  # policies never fight each other as the pipeline grows.
+  RawVideoBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub video-pipeline-raw-${AWS::AccountId}
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins: ['*'] # tighten to the real frontend origin once it has a fixed domain
+            AllowedMethods: [PUT]
+            AllowedHeaders: ['*']
+            MaxAge: 3000
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireUploadsAfter7Days
+            Status: Enabled
+            ExpirationInDays: 7 # raw uploads are transient inputs, not the product - keep this at $0
+
+  GetUploadUrlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: get-upload-url
+      CodeUri: src/get-upload-url/
+      Handler: index.handler
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref RawVideoBucket
+      # Scoped to the uploads/ prefix only, not the whole bucket - least privilege
+      # even though today the bucket only ever holds that prefix.
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${RawVideoBucket}/uploads/*
+      FunctionUrlConfig:
+        AuthType: NONE # placeholder for Day 1 only - see README security model section before going further
+        Cors:
+          AllowOrigins: ['*']
+          AllowMethods: [GET]
+          AllowHeaders: [content-type]
+
+Outputs:
+  UploadFunctionUrl:
+    Description: Public URL for the get-upload-url Lambda
+    Value: !GetAtt GetUploadUrlFunctionUrl.FunctionUrl
+  RawVideoBucketName:
+    Description: Name of the S3 bucket that receives raw uploads
+    Value: !Ref RawVideoBucket

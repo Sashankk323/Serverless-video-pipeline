@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Video Upload — Day 1</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 480px; margin: 4rem auto; padding: 0 1rem; color: #1a1a1a; }
+  h1 { font-size: 1.25rem; }
+  #progress-wrap { background: #eee; border-radius: 4px; height: 12px; margin: 1rem 0; overflow: hidden; }
+  #progress-bar { background: #2563eb; height: 100%; width: 0%; transition: width 0.15s ease; }
+  #status { font-size: 0.9rem; color: #444; white-space: pre-wrap; }
+  button { padding: 0.5rem 1rem; cursor: pointer; }
+</style>
+</head>
+<body>
+  <h1>Upload a video</h1>
+  <input type="file" id="file-input" accept="video/*" />
+  <button id="upload-btn">Upload</button>
+  <div id="progress-wrap"><div id="progress-bar"></div></div>
+  <div id="status">Pick a file to begin.</div>
+
+<script>
+  // Injected after `sam deploy` by reading the stack's UploadFunctionUrl output.
+  const GET_UPLOAD_URL_ENDPOINT = "https://bcnp72djpjcsw73ymkt2pafbzy0gqzmk.lambda-url.us-east-1.on.aws/";
+
+  const fileInput = document.getElementById('file-input');
+  const uploadBtn = document.getElementById('upload-btn');
+  const progressBar = document.getElementById('progress-bar');
+  const statusEl = document.getElementById('status');
+
+  function setStatus(msg) {
+    statusEl.textContent = msg;
+  }
+
+  uploadBtn.addEventListener('click', async () => {
+    const file = fileInput.files[0];
+    if (!file) {
+      setStatus('Choose a file first.');
+      return;
+    }
+    if (!file.type.startsWith('video/')) {
+      setStatus(`"${file.type || 'unknown type'}" is not a video file.`);
+      return;
+    }
+
+    uploadBtn.disabled = true;
+    progressBar.style.width = '0%';
+
+    try {
+      setStatus('Requesting presigned upload URL...');
+      const params = new URLSearchParams({ filename: file.name, contentType: file.type });
+      const res = await fetch(`${GET_UPLOAD_URL_ENDPOINT}?${params.toString()}`);
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || `Failed to get upload URL (${res.status})`);
+      }
+      const { uploadUrl, key } = await res.json();
+
+      setStatus(`Uploading as ${key} ...`);
+      await putWithProgress(uploadUrl, file);
+
+      setStatus(`Done. Stored at: ${key}`);
+      progressBar.style.width = '100%';
+    } catch (err) {
+      setStatus(`Error: ${err.message}`);
+    } finally {
+      uploadBtn.disabled = false;
+    }
+  });
+
+  function putWithProgress(url, file) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('PUT', url);
+      xhr.setRequestHeader('Content-Type', file.type);
+
+      xhr.upload.addEventListener('progress', (e) => {
+        if (e.lengthComputable) {
+          const pct = Math.round((e.loaded / e.total) * 100);
+          progressBar.style.width = `${pct}%`;
+          setStatus(`Uploading... ${pct}%`);
+        }
+      });
+
+      xhr.addEventListener('load', () => {
+        if (xhr.status >= 200 && xhr.status < 300) resolve();
+        else reject(new Error(`S3 PUT failed with status ${xhr.status}`));
+      });
+      xhr.addEventListener('error', () => reject(new Error('Network error during upload')));
+
+      xhr.send(file);
+    });
+  }
+</script>
+</body>
+</html>
