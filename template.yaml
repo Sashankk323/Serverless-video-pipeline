@@ -1,14 +1,18 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  Video transcoding pipeline - Day 1: presigned-URL upload path.
-  Future days will add an S3 event trigger, Step Functions, transcode Lambdas,
-  an HLS output bucket, and CloudFront in front of it.
+  Video transcoding pipeline - Day 2: presigned-URL upload path (Day 1) plus a
+  direct S3-triggered container-image Lambda that transcodes uploads to 720p
+  MP4 with a static ffmpeg build. Step Functions orchestration, HLS output,
+  and CloudFront arrive in later days.
 
 Globals:
   Function:
-    Runtime: nodejs20.x
-    Architectures: [arm64]
+    # Runtime and Architectures are intentionally NOT set here: TranscodeFunction
+    # is PackageType Image with an x86_64 image (to match the static ffmpeg
+    # build), and SAM's Globals merge for Architectures on Image functions
+    # errors out even when the function-level value would otherwise override it.
+    # Each function sets both explicitly instead.
     Timeout: 10
     MemorySize: 128
 
@@ -36,6 +40,8 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: get-upload-url
+      Runtime: nodejs20.x
+      Architectures: [arm64]
       CodeUri: src/get-upload-url/
       Handler: index.handler
       Environment:
@@ -55,6 +61,70 @@ Resources:
           AllowMethods: [GET]
           AllowHeaders: [content-type]
 
+  # Separate from RawVideoBucket on purpose: the transcode Lambda writes here,
+  # never back to the bucket that triggered it, which is what rules out a
+  # recursive invocation loop by construction (not just by prefix filtering).
+  OutputVideoBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub video-pipeline-output-${AWS::AccountId}
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireProcessedAfter7Days
+            Status: Enabled
+            ExpirationInDays: 7 # same free-tier-friendly retention as the raw bucket, for now
+
+  TranscodeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: transcode-video
+      PackageType: Image
+      # Static ffmpeg build in the image is amd64 - must match the Lambda's
+      # execution architecture, overriding the arm64 Globals default.
+      Architectures: [x86_64]
+      MemorySize: 3008 # more memory also means more vCPU share, which is what actually speeds up ffmpeg
+      Timeout: 900
+      EphemeralStorage:
+        Size: 2048 # default 512MB /tmp is too small once you're holding both the input and 720p output
+      Environment:
+        Variables:
+          OUTPUT_BUCKET: !Ref OutputVideoBucket
+      Policies:
+        # Read-only on the raw bucket, scoped to uploads/ - can't delete, list,
+        # or touch anything outside the prefix it was triggered from.
+        # ARN is built from the bucket's deterministic name (not !Ref/!GetAtt on
+        # RawVideoBucket) to avoid a circular dependency: the S3 Event below
+        # already makes RawVideoBucket depend on this function's permission, so
+        # this policy referencing the bucket resource directly would cycle back.
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub arn:aws:s3:::video-pipeline-raw-${AWS::AccountId}/uploads/*
+        # Write-only on the output bucket, scoped to processed/ - can't read
+        # back its own writes or anyone else's objects.
+        - Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${OutputVideoBucket}/processed/*
+      Events:
+        VideoUploaded:
+          Type: S3
+          Properties:
+            Bucket: !Ref RawVideoBucket
+            Events: s3:ObjectCreated:*
+            # Second guard against recursion (first is the separate output
+            # bucket): even a future misconfiguration that pointed this trigger
+            # at the wrong bucket couldn't self-loop past this prefix filter.
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: uploads/
+    Metadata:
+      Dockerfile: Dockerfile
+      DockerContext: ./src/transcode
+      DockerTag: latest
+
 Outputs:
   UploadFunctionUrl:
     Description: Public URL for the get-upload-url Lambda
@@ -62,3 +132,6 @@ Outputs:
   RawVideoBucketName:
     Description: Name of the S3 bucket that receives raw uploads
     Value: !Ref RawVideoBucket
+  OutputVideoBucketName:
+    Description: Name of the S3 bucket that receives transcoded 720p output
+    Value: !Ref OutputVideoBucket
