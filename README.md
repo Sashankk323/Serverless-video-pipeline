@@ -3,6 +3,70 @@
 A serverless video transcoding pipeline on AWS. This repo is built incrementally,
 day by day; this README tracks what exists **today**.
 
+## Architecture — Day 3 (Step Functions orchestration, parallel renditions)
+
+```
+S3 raw bucket (uploads/{jobId}/{filename})
+   │  EventBridge notification, "Object Created", filtered to prefix uploads/
+   ▼
+EventBridge rule ──▶ starts execution ──▶ Step Functions state machine
+```
+
+```
+PrepareJob (Pass)
+  extract jobId / sourceKey / bucket from the event
+        │
+        ▼
+┌───────────────────────────────────────────────────────────────┐
+│ JobPipeline (Parallel, single branch — used as a try/catch)   │
+│                                                                 │
+│  MarkJobStarted          Probe                MarkTranscoding  │
+│  ddb:putItem       ──▶  Lambda (ffprobe)  ──▶  ddb:updateItem  │
+│  status=PROBING         builds rendition        status=       │
+│                         plan (no upscale,       TRANSCODING    │
+│                         floor at 480p)               │         │
+│                                                       ▼         │
+│                          TranscodeFanout (Map, MaxConcurrency 3)│
+│                          ┌──────────┬──────────┬──────────┐   │
+│                          │Transcode │Transcode │Transcode │   │
+│                          │  1080p   │  720p    │  480p    │   │
+│                          │ (Lambda) │ (Lambda) │ (Lambda) │   │
+│                          └──────────┴──────────┴──────────┘   │
+│                                       │                        │
+│                                       ▼                        │
+│                          MarkCompleted (ddb:updateItem)         │
+│                          status=COMPLETED                       │
+│                                                                 │
+│  Catch: States.ALL ────────────────────────────────────────────┼──▶ MarkFailed
+└─────────────────────────────────────────────────────────────────┘   ddb:updateItem
+                                                                        status=FAILED
+```
+
+`ProbeFunction` and `TranscodeFunction` are two `AWS::Serverless::Function`
+resources built from **one** container image (`src/worker/Dockerfile`, holding
+both `probe.mjs` and `transcode.mjs`) — they differ only in `ImageConfig.Command`.
+Both Lambdas are invoked directly by Step Functions with an explicit JSON
+payload; neither parses S3 events anymore, and neither is triggered by S3 at all.
+
+All `Mark*` states write straight to DynamoDB via the direct SDK integration
+(`arn:aws:states:::dynamodb:putItem` / `updateItem`) — no Lambda in the loop
+just to flip a status field.
+
+### DynamoDB job record shape
+
+| Attribute | Written by | Meaning |
+|---|---|---|
+| `jobId` (partition key) | — | the `{uuid}` segment of `uploads/{uuid}/{filename}` |
+| `status` | every `Mark*` state | `PROBING` → `TRANSCODING` → `COMPLETED`, or `FAILED` |
+| `sourceKey`, `createdAt` | MarkJobStarted | original upload key, job start time |
+| `sourceHeight`, `plannedRenditions` | MarkTranscoding | source video height, JSON-stringified rendition plan |
+| `renditions` | MarkCompleted | JSON-stringified list of `{height, outputKey, transcodeMs}` |
+| `errorMessage` | MarkFailed | the Step Functions error name + cause |
+| `updatedAt` | every `Mark*` state | last-write timestamp |
+
+`plannedRenditions`/`renditions` are stored as **JSON strings**, not native
+DynamoDB Lists — see gotchas below for why.
+
 ## Architecture — Day 2 (adds automatic transcoding)
 
 ```
@@ -26,8 +90,10 @@ binaries routinely break on glibc/shared-library mismatches between build and
 execution environments; a static binary in the image sidesteps that class of
 bug entirely.
 
-No Step Functions yet — this is a direct S3 event → Lambda trigger. Step
-Functions orchestration (retries, parallel renditions, fan-out) is Day 3.
+**Superseded on Day 3** — the direct S3 event → Lambda trigger described here
+was removed in the same deploy that added the EventBridge rule + state machine
+above, so the two trigger paths never coexist (that would double-transcode
+every upload). Kept below for history.
 
 ## Architecture — Day 1 (upload path only)
 
@@ -55,9 +121,10 @@ and stateless, which matters once the pipeline fans out to multiple transcode jo
 
 | Future piece | Where it plugs in |
 |---|---|
-| Step Functions orchestration (Day 3) | Replaces the direct S3 → Lambda trigger on `TranscodeFunction` with a state machine; retries/fan-out/multiple renditions live there instead of in Lambda code. |
 | HLS output bucket + CloudFront | A second `AWS::S3::Bucket` + `AWS::CloudFront::Distribution` in the same template; doesn't touch the raw bucket or existing Lambdas. |
 | hls.js player | Replaces/extends `frontend/index.html`; the upload flow here is unaffected. |
+
+*(Step Functions orchestration — retries, parallel renditions, fan-out, DynamoDB job tracking — shipped in Day 3. See the Day 3 section above.)*
 
 *(Automatic transcoding via a direct S3 event → Lambda trigger shipped in Day 2 — see the Day 2 section above.)*
 
@@ -101,9 +168,9 @@ bucket's event notifications shouldn't have to filter out the other's writes.
 ## Deploying
 
 Prerequisites: AWS CLI configured, SAM CLI installed, **Docker running**
-(required from Day 2 on — `TranscodeFunction` is a container-image Lambda, and
-`sam build` needs Docker to build its image), an AWS account (region:
-`us-east-1`).
+(required from Day 2 on — `ProbeFunction`/`TranscodeFunction` are container-image
+Lambdas, and `sam build` needs Docker to build the image), an AWS account
+(region: `us-east-1`).
 
 ```bash
 sam build
@@ -112,8 +179,9 @@ sam deploy --guided --stack-name video-pipeline --resolve-image-repos
 
 On first deploy, `sam deploy --guided` will ask for stack name, region, and save
 your answers to `samconfig.toml` for future `sam deploy` runs. `--resolve-image-repos`
-lets SAM create and manage the ECR repository for `TranscodeFunction`'s image
-automatically — no manual ECR setup needed.
+lets SAM create and manage an ECR repository per image-based function
+automatically — no manual ECR setup needed. `ProbeFunction` and `TranscodeFunction`
+still get **two** repos even though they share one image (see gotchas below).
 
 After deploy, grab the Lambda Function URL from the stack outputs:
 
@@ -145,20 +213,51 @@ with a non-video `contentType` (or omitting `filename`) should return `400`.
 ## Testing the transcode pipeline end-to-end
 
 Upload a file directly to the raw bucket's `uploads/` prefix (mimicking what
-the presigned-URL flow produces — `uploads/{uuid}/{filename}`), then check the
-output bucket a few seconds later:
+the presigned-URL flow produces — `uploads/{jobId}/{filename}`), then poll the
+DynamoDB job record as it moves through `PROBING` → `TRANSCODING` → `COMPLETED`:
 
 ```bash
-UUID=$(uuidgen)
-aws s3 cp my-video.mp4 "s3://video-pipeline-raw-<account-id>/uploads/$UUID/my-video.mp4"
-sleep 15
-aws s3 ls "s3://video-pipeline-output-<account-id>/processed/$UUID/"
+JOB_ID=$(uuidgen)
+aws s3 cp my-video.mp4 "s3://video-pipeline-raw-<account-id>/uploads/$JOB_ID/my-video.mp4"
+
+# poll until status stops changing
+watch -n2 "aws dynamodb get-item --table-name video-pipeline-jobs \
+  --key '{\"jobId\":{\"S\":\"$JOB_ID\"}}'"
 ```
 
-If nothing shows up, check the Lambda's logs — each invocation logs a
-download/transcode/upload timeline:
+Once `status` is `COMPLETED`, check the parallel outputs:
 
 ```bash
+aws s3 ls "s3://video-pipeline-output-<account-id>/processed/$JOB_ID/"
+```
+
+You should see up to three files (`1080p.mp4`, `720p.mp4`, `480p.mp4`) —
+fewer if the source video is shorter than one of those heights, since the
+Probe step never upscales.
+
+To test the failure path, upload something that isn't a video (a `.txt` file
+renamed `.mp4` works) and poll the same way — `status` should land on `FAILED`
+with an `errorMessage`, never stuck on `TRANSCODING`.
+
+If a job doesn't show up in DynamoDB at all, the EventBridge rule likely isn't
+firing — check the state machine's executions and event history first:
+
+```bash
+aws stepfunctions list-executions --state-machine-arn <PipelineStateMachineArn output>
+aws stepfunctions get-execution-history --execution-arn <execution ARN>
+```
+
+Note: a Step Functions **execution** status of `SUCCEEDED` does not mean the
+*job* succeeded — a job that hits `MarkFailed` via the Catch still completes
+its execution normally (the state machine did its job by recording the
+failure). Always check the DynamoDB `status` field, not the execution status,
+for job outcome.
+
+For Lambda-level detail (download/probe/transcode/upload timings), check the
+individual function logs:
+
+```bash
+aws logs tail /aws/lambda/probe-video --since 10m
 aws logs tail /aws/lambda/transcode-video --since 10m
 ```
 
@@ -212,9 +311,71 @@ aws logs tail /aws/lambda/transcode-video --since 10m
   static ffmpeg `.tar.xz` archive failed with `tar: command not found` until
   the Dockerfile installed both via `dnf` first.
 
+### Day 3 additions
+
+- **Removing the double-trigger footgun** — the whole point of Day 3's deploy
+  was to swap trigger mechanisms, not add a second one. `TranscodeFunction`'s
+  `Events: S3` block was deleted in the *same* template change that added the
+  EventBridge rule, so there was never a deploy where both were live at once —
+  a sequenced two-step migration (add EventBridge first, remove S3 trigger
+  later) would have double-transcoded every upload landing in the gap.
+- **No-upscale logic lives in the Probe Lambda, not in ASL** — comparing
+  `candidate height <= source height` is a one-line JS filter; expressing the
+  same comparison in Step Functions' JSONPath/intrinsic-function language would
+  need a `Choice` state per candidate height. The state machine just `Map`s
+  over whatever list `probe.mjs` returns — see `buildRenditionPlan()`. The one
+  wrinkle: "always include 480p" can mean upscaling a source shorter than
+  480p, which technically contradicts "never upscale" — resolved in 480p's
+  favor since a job should never finish with zero renditions.
+- **Map, not Parallel, for the fanout** — `Parallel` requires a fixed,
+  hardcoded number of branches at deploy time. The rendition count here is
+  *dynamic* (1-3 renditions depending on the source's height), which is
+  exactly what `Map` is for: it iterates over a runtime-determined list
+  (`ItemsPath: $.probe.renditions`) with `MaxConcurrency` capping how many run
+  at once. `Parallel` is still used once in this state machine — but only as
+  a single-branch try/catch scope around the whole job (`JobPipeline`), not
+  for the fanout.
+- **Step Functions' direct DynamoDB integration can't auto-convert a plain
+  JSON array into a native DynamoDB List** — `arn:aws:states:::dynamodb:putItem`/
+  `updateItem` require every attribute value to already be in DynamoDB's typed
+  `AttributeValue` JSON shape (`{"S": "..."}`, `{"N": "..."}`, `{"L": [...]}` with
+  each element *also* typed). A Map/Lambda result like
+  `[{"height":1080,"outputKey":"..."}]` isn't that shape, and hand-building the
+  nested `L`/`M` wrapper in ASL for a dynamic-length list is the kind of thing
+  that turns a 5-line Task state into an unreadable 40-line one. Sidestepped by
+  storing `plannedRenditions`/`renditions` as a single **String** attribute via
+  the `States.JsonToString(...)` intrinsic instead — you lose native Dynamo
+  querying into individual renditions, but at this scale nothing queries by
+  rendition anyway.
+- **A Step Functions execution can `SUCCEED` even when the job `FAILED`** —
+  the `Catch` on `JobPipeline` routes any error to `MarkFailed`, which then
+  completes normally. That makes the *execution's* status `SUCCEEDED` for both
+  the happy path and the handled-failure path; the only place the real outcome
+  lives is the `status` attribute in DynamoDB. Confusing the two the first
+  time cost a few minutes of "why does the corrupt-file test show SUCCEEDED."
+- **EventBridge's S3 notification event needs an explicit `InputPath`** — the
+  raw EventBridge event envelope (`source`, `account`, `region`, `detail-type`,
+  `detail`, ...) isn't what the state machine should operate on; only
+  `detail.bucket.name` / `detail.object.key` matter. `UploadCreatedRule` sets
+  `InputPath: $.detail` so the execution's actual input is just
+  `{bucket, object, request-id, ...}` — confirmed against a live execution's
+  `input` field, not just assumed from docs.
+- **One image, two ECR repos** — `ProbeFunction` and `TranscodeFunction` share
+  a single `Dockerfile`/build context (`src/worker/`), and SAM's build step
+  correctly deduplicates the actual `docker build` into one local image when
+  both functions' `Metadata` blocks match byte-for-byte. `sam deploy
+  --resolve-image-repos` still provisions one ECR repository *per function*
+  though, so the identical image gets pushed twice. At this project's size
+  (a few hundred MB, free-tier ECR storage) that's not worth fighting SAM's
+  per-function image model to avoid.
+
 ## Cost
 
 Everything here fits in the AWS always-free / 12-month-free tiers at low volume:
 S3 (5GB free, plus a 7-day lifecycle rule bounding storage), Lambda (1M free
-requests/month), and Lambda Function URLs (no additional charge beyond Lambda
-invocation). No NAT gateways, no always-on compute.
+requests/month), Lambda Function URLs (no additional charge beyond Lambda
+invocation), DynamoDB on-demand (25GB + generous request-unit free tier, no
+provisioned capacity to forget about), Step Functions Standard workflows
+(4,000 free state transitions/month), and EventBridge (no charge for rules
+matching AWS service events like S3 notifications). No NAT gateways, no
+always-on compute.

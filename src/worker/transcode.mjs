@@ -7,18 +7,18 @@ import { S3Client, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3
 const s3 = new S3Client({});
 const OUTPUT_BUCKET = process.env.OUTPUT_BUCKET;
 
-// S3 event keys arrive URL-encoded, and spaces are encoded as '+' rather than
-// '%20' (a leftover from S3's form-encoding heritage) - decodeURIComponent
-// alone leaves literal '+' characters in the filename, so swap those first.
+// Keys can still arrive URL-encoded with '+' for spaces (form-encoding
+// heritage) - harmless to run on an already-clean key, but cheap insurance
+// since this key traces back to an S3 object key however it reaches us.
 function decodeS3Key(rawKey) {
   return decodeURIComponent(rawKey.replace(/\+/g, ' '));
 }
 
-async function runFfmpeg(inputPath, outputPath) {
+async function runFfmpeg(inputPath, outputPath, height) {
   await new Promise((resolve, reject) => {
     const ffmpeg = spawn('/usr/local/bin/ffmpeg', [
       '-i', inputPath,
-      '-vf', 'scale=-2:720',
+      '-vf', `scale=-2:${height}`,
       '-c:v', 'libx264',
       '-c:a', 'aac',
       '-movflags', '+faststart',
@@ -44,34 +44,28 @@ async function runFfmpeg(inputPath, outputPath) {
   });
 }
 
-async function processRecord(record) {
-  const bucket = record.s3.bucket.name;
-  const key = decodeS3Key(record.s3.object.key);
+// Payload shape, set by the TranscodeFanout Map state in the state machine:
+// { bucket, key, jobId, height, outputKey }
+export const handler = async (event) => {
+  const { bucket, jobId, height, outputKey } = event;
+  const key = decodeS3Key(event.key);
 
-  // Expected shape: uploads/{uuid}/{filename}
-  const parts = key.split('/');
-  if (parts.length < 3 || parts[0] !== 'uploads') {
-    console.warn(`Skipping key with unexpected shape: ${key}`);
-    return;
-  }
-  const uuid = parts[1];
+  const inputPath = `/tmp/${jobId}-${height}p-input`;
+  const outputPath = `/tmp/${jobId}-${height}p-output.mp4`;
 
-  const inputPath = `/tmp/${uuid}-input`;
-  const outputPath = `/tmp/${uuid}-720p.mp4`;
-
-  console.log(`[${uuid}] start - bucket=${bucket} key=${key}`);
+  console.log(`[${jobId}] start ${height}p - bucket=${bucket} key=${key}`);
 
   try {
     const downloadStart = Date.now();
     const getResult = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
     await pipeline(getResult.Body, createWriteStream(inputPath));
-    console.log(`[${uuid}] download complete in ${Date.now() - downloadStart}ms`);
+    console.log(`[${jobId}] ${height}p download complete in ${Date.now() - downloadStart}ms`);
 
     const transcodeStart = Date.now();
-    await runFfmpeg(inputPath, outputPath);
-    console.log(`[${uuid}] transcode complete in ${Date.now() - transcodeStart}ms`);
+    await runFfmpeg(inputPath, outputPath, height);
+    const transcodeMs = Date.now() - transcodeStart;
+    console.log(`[${jobId}] ${height}p transcode complete in ${transcodeMs}ms`);
 
-    const outputKey = `processed/${uuid}/720p.mp4`;
     const uploadStart = Date.now();
     await s3.send(new PutObjectCommand({
       Bucket: OUTPUT_BUCKET,
@@ -79,17 +73,13 @@ async function processRecord(record) {
       Body: createReadStream(outputPath),
       ContentType: 'video/mp4',
     }));
-    console.log(`[${uuid}] upload complete in ${Date.now() - uploadStart}ms - output=${OUTPUT_BUCKET}/${outputKey}`);
+    console.log(`[${jobId}] ${height}p upload complete in ${Date.now() - uploadStart}ms - output=${OUTPUT_BUCKET}/${outputKey}`);
+
+    return { height, outputKey, transcodeMs };
   } finally {
     await Promise.all([
       unlink(inputPath).catch(() => {}),
       unlink(outputPath).catch(() => {}),
     ]);
-  }
-}
-
-export const handler = async (event) => {
-  for (const record of event.Records) {
-    await processRecord(record);
   }
 };

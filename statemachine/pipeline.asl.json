@@ -1,0 +1,195 @@
+{
+  "Comment": "Probe a raw upload, fan out to 1080p/720p/480p transcodes (skipping upscales), track status in DynamoDB.",
+  "StartAt": "PrepareJob",
+  "States": {
+    "PrepareJob": {
+      "Type": "Pass",
+      "Comment": "jobId is the {uuid} segment of uploads/{uuid}/{filename} - derived here so every later state can reference $.jobId directly.",
+      "Parameters": {
+        "jobId.$": "States.ArrayGetItem(States.StringSplit($.object.key, '/'), 1)",
+        "sourceKey.$": "$.object.key",
+        "bucket.$": "$.bucket.name"
+      },
+      "Next": "JobPipeline"
+    },
+    "JobPipeline": {
+      "Type": "Parallel",
+      "Comment": "Single branch used purely as a try/catch scope - Step Functions has no native way to wrap multiple sibling states in one Catch.",
+      "Branches": [
+        {
+          "StartAt": "MarkJobStarted",
+          "States": {
+            "MarkJobStarted": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::dynamodb:putItem",
+              "Parameters": {
+                "TableName": "${JobsTableName}",
+                "Item": {
+                  "jobId": { "S.$": "$.jobId" },
+                  "status": { "S": "PROBING" },
+                  "sourceKey": { "S.$": "$.sourceKey" },
+                  "createdAt": { "S.$": "$$.State.EnteredTime" },
+                  "updatedAt": { "S.$": "$$.State.EnteredTime" }
+                }
+              },
+              "ResultPath": null,
+              "Next": "Probe"
+            },
+            "Probe": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ProbeFunctionArn}",
+                "Payload": {
+                  "bucket.$": "$.bucket",
+                  "key.$": "$.sourceKey",
+                  "jobId.$": "$.jobId"
+                }
+              },
+              "ResultSelector": {
+                "width.$": "$.Payload.width",
+                "height.$": "$.Payload.height",
+                "duration.$": "$.Payload.duration",
+                "renditions.$": "$.Payload.renditions"
+              },
+              "ResultPath": "$.probe",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.AWSLambdaException",
+                    "Lambda.SdkClientException",
+                    "Lambda.TooManyRequestsException"
+                  ],
+                  "IntervalSeconds": 2,
+                  "BackoffRate": 2,
+                  "MaxAttempts": 2
+                }
+              ],
+              "Next": "MarkTranscoding"
+            },
+            "MarkTranscoding": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::dynamodb:updateItem",
+              "Parameters": {
+                "TableName": "${JobsTableName}",
+                "Key": {
+                  "jobId": { "S.$": "$.jobId" }
+                },
+                "UpdateExpression": "SET #status = :status, updatedAt = :now, sourceHeight = :sourceHeight, plannedRenditions = :plannedRenditions",
+                "ExpressionAttributeNames": {
+                  "#status": "status"
+                },
+                "ExpressionAttributeValues": {
+                  ":status": { "S": "TRANSCODING" },
+                  ":now": { "S.$": "$$.State.EnteredTime" },
+                  ":sourceHeight": { "N.$": "States.Format('{}', $.probe.height)" },
+                  ":plannedRenditions": { "S.$": "States.JsonToString($.probe.renditions)" }
+                }
+              },
+              "ResultPath": null,
+              "Next": "TranscodeFanout"
+            },
+            "TranscodeFanout": {
+              "Type": "Map",
+              "Comment": "Map over the rendition plan (dynamic length, 1-3 items depending on source height) - not a hardcoded Parallel.",
+              "ItemsPath": "$.probe.renditions",
+              "MaxConcurrency": 3,
+              "ItemSelector": {
+                "bucket.$": "$.bucket",
+                "key.$": "$.sourceKey",
+                "jobId.$": "$.jobId",
+                "height.$": "$$.Map.Item.Value.height",
+                "outputKey.$": "States.Format('processed/{}/{}p.mp4', $.jobId, $$.Map.Item.Value.height)"
+              },
+              "ItemProcessor": {
+                "ProcessorConfig": { "Mode": "INLINE" },
+                "StartAt": "Transcode",
+                "States": {
+                  "Transcode": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::lambda:invoke",
+                    "Parameters": {
+                      "FunctionName": "${TranscodeFunctionArn}",
+                      "Payload.$": "$"
+                    },
+                    "ResultSelector": {
+                      "height.$": "$.Payload.height",
+                      "outputKey.$": "$.Payload.outputKey",
+                      "transcodeMs.$": "$.Payload.transcodeMs"
+                    },
+                    "Retry": [
+                      {
+                        "ErrorEquals": [
+                          "Lambda.ServiceException",
+                          "Lambda.AWSLambdaException",
+                          "Lambda.SdkClientException",
+                          "Lambda.TooManyRequestsException"
+                        ],
+                        "IntervalSeconds": 2,
+                        "BackoffRate": 2,
+                        "MaxAttempts": 2
+                      }
+                    ],
+                    "End": true
+                  }
+                }
+              },
+              "ResultPath": "$.transcodeResults",
+              "Next": "MarkCompleted"
+            },
+            "MarkCompleted": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::dynamodb:updateItem",
+              "Parameters": {
+                "TableName": "${JobsTableName}",
+                "Key": {
+                  "jobId": { "S.$": "$.jobId" }
+                },
+                "UpdateExpression": "SET #status = :status, updatedAt = :now, renditions = :renditions",
+                "ExpressionAttributeNames": {
+                  "#status": "status"
+                },
+                "ExpressionAttributeValues": {
+                  ":status": { "S": "COMPLETED" },
+                  ":now": { "S.$": "$$.State.EnteredTime" },
+                  ":renditions": { "S.$": "States.JsonToString($.transcodeResults)" }
+                }
+              },
+              "ResultPath": null,
+              "End": true
+            }
+          }
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
+      "End": true
+    },
+    "MarkFailed": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${JobsTableName}",
+        "Key": {
+          "jobId": { "S.$": "$.jobId" }
+        },
+        "UpdateExpression": "SET #status = :status, updatedAt = :now, errorMessage = :err",
+        "ExpressionAttributeNames": {
+          "#status": "status"
+        },
+        "ExpressionAttributeValues": {
+          ":status": { "S": "FAILED" },
+          ":now": { "S.$": "$$.State.EnteredTime" },
+          ":err": { "S.$": "States.Format('{}: {}', $.error.Error, $.error.Cause)" }
+        }
+      },
+      "End": true
+    }
+  }
+}

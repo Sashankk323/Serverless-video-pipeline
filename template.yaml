@@ -1,18 +1,19 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  Video transcoding pipeline - Day 2: presigned-URL upload path (Day 1) plus a
-  direct S3-triggered container-image Lambda that transcodes uploads to 720p
-  MP4 with a static ffmpeg build. Step Functions orchestration, HLS output,
-  and CloudFront arrive in later days.
+  Video transcoding pipeline - Day 3: presigned-URL upload path (Day 1) feeds
+  a Step Functions state machine (Day 3) that probes each upload with ffprobe,
+  fans out to 1080p/720p/480p transcodes in parallel (skipping upscales), and
+  tracks job status in DynamoDB. Replaces Day 2's direct S3-to-Lambda trigger.
+  HLS output and CloudFront arrive in later days.
 
 Globals:
   Function:
-    # Runtime and Architectures are intentionally NOT set here: TranscodeFunction
-    # is PackageType Image with an x86_64 image (to match the static ffmpeg
-    # build), and SAM's Globals merge for Architectures on Image functions
-    # errors out even when the function-level value would otherwise override it.
-    # Each function sets both explicitly instead.
+    # Runtime and Architectures are intentionally NOT set here: ProbeFunction
+    # and TranscodeFunction are PackageType Image with an x86_64 image (to
+    # match the static ffmpeg/ffprobe build), and SAM's Globals merge for
+    # Architectures on Image functions errors out even when the function-level
+    # value would otherwise override it. Each function sets both explicitly instead.
     Timeout: 10
     MemorySize: 128
 
@@ -35,6 +36,13 @@ Resources:
           - Id: ExpireUploadsAfter7Days
             Status: Enabled
             ExpirationInDays: 7 # raw uploads are transient inputs, not the product - keep this at $0
+      # Day 3: replaces the direct S3 Event -> Lambda trigger with EventBridge
+      # notifications, which the EventBridge Rule below filters and routes to
+      # the state machine. Both mechanisms are never configured at once - that
+      # would double-transcode every upload.
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
 
   GetUploadUrlFunction:
     Type: AWS::Serverless::Function
@@ -74,6 +82,37 @@ Resources:
             Status: Enabled
             ExpirationInDays: 7 # same free-tier-friendly retention as the raw bucket, for now
 
+  # Day 3: probe and transcode share one image (src/worker/Dockerfile has both
+  # handlers baked in) - each function resource still triggers its own
+  # `sam build`/ECR push under the hood, but there's exactly one Dockerfile
+  # and one build context to maintain, and the two diverge only in
+  # ImageConfig.Command.
+  ProbeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: probe-video
+      PackageType: Image
+      Architectures: [x86_64] # matches the static ffmpeg/ffprobe build baked into the shared image
+      MemorySize: 512 # ffprobe just reads headers/metadata, doesn't need transcode-grade memory
+      Timeout: 60
+      EphemeralStorage:
+        Size: 1024 # only ever holds the source download, never an output file
+      ImageConfig:
+        Command: ['probe.handler']
+      Policies:
+        # Read-only on the raw bucket, scoped to uploads/ - the state machine
+        # is now what removes the old circular-dependency constraint (no S3
+        # Event trigger left on either function), so this can reference the
+        # bucket resource directly instead of its deterministic name.
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub '${RawVideoBucket.Arn}/uploads/*'
+    Metadata:
+      Dockerfile: Dockerfile
+      DockerContext: ./src/worker
+      DockerTag: latest
+
   TranscodeFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -85,45 +124,117 @@ Resources:
       MemorySize: 3008 # more memory also means more vCPU share, which is what actually speeds up ffmpeg
       Timeout: 900
       EphemeralStorage:
-        Size: 2048 # default 512MB /tmp is too small once you're holding both the input and 720p output
+        Size: 2048 # default 512MB /tmp is too small once you're holding both the input and one rendition's output
+      ImageConfig:
+        Command: ['transcode.handler']
       Environment:
         Variables:
           OUTPUT_BUCKET: !Ref OutputVideoBucket
       Policies:
         # Read-only on the raw bucket, scoped to uploads/ - can't delete, list,
-        # or touch anything outside the prefix it was triggered from.
-        # ARN is built from the bucket's deterministic name (not !Ref/!GetAtt on
-        # RawVideoBucket) to avoid a circular dependency: the S3 Event below
-        # already makes RawVideoBucket depend on this function's permission, so
-        # this policy referencing the bucket resource directly would cycle back.
+        # or touch anything outside that prefix.
         - Statement:
             - Effect: Allow
               Action: s3:GetObject
-              Resource: !Sub arn:aws:s3:::video-pipeline-raw-${AWS::AccountId}/uploads/*
+              Resource: !Sub '${RawVideoBucket.Arn}/uploads/*'
         # Write-only on the output bucket, scoped to processed/ - can't read
         # back its own writes or anyone else's objects.
         - Statement:
             - Effect: Allow
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${OutputVideoBucket}/processed/*
-      Events:
-        VideoUploaded:
-          Type: S3
-          Properties:
-            Bucket: !Ref RawVideoBucket
-            Events: s3:ObjectCreated:*
-            # Second guard against recursion (first is the separate output
-            # bucket): even a future misconfiguration that pointed this trigger
-            # at the wrong bucket couldn't self-loop past this prefix filter.
-            Filter:
-              S3Key:
-                Rules:
-                  - Name: prefix
-                    Value: uploads/
     Metadata:
       Dockerfile: Dockerfile
-      DockerContext: ./src/transcode
+      DockerContext: ./src/worker
       DockerTag: latest
+
+  # Single-table job tracker. On-demand billing - free-tier friendly, no
+  # capacity planning for a pipeline that runs on-demand per upload.
+  JobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: video-pipeline-jobs
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: jobId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: jobId
+          KeyType: HASH
+
+  # State machine's own role, scoped to exactly what each state needs: invoke
+  # the two Lambdas by ARN, read/write only this table. No Lambda-based status
+  # writes - MarkJobStarted/MarkTranscoding/MarkCompleted/MarkFailed all use
+  # the direct dynamodb:putItem/updateItem SDK integration.
+  PipelineStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: video-pipeline-transcode
+      Type: STANDARD
+      DefinitionUri: statemachine/pipeline.asl.json
+      DefinitionSubstitutions:
+        JobsTableName: !Ref JobsTable
+        ProbeFunctionArn: !GetAtt ProbeFunction.Arn
+        TranscodeFunctionArn: !GetAtt TranscodeFunction.Arn
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource:
+                - !GetAtt ProbeFunction.Arn
+                - !GetAtt TranscodeFunction.Arn
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+              Resource: !GetAtt JobsTable.Arn
+
+  # EventBridge only invokes states:StartExecution on this one state machine -
+  # it can't touch the Lambdas, buckets, or table directly.
+  EventBridgeStartExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartPipelineExecution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref PipelineStateMachine
+
+  # Fires the state machine on every new upload. Replaces Day 2's direct S3
+  # Event -> Lambda trigger (removed above, on TranscodeFunction) so the two
+  # paths never run simultaneously and double-transcode an upload.
+  UploadCreatedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: video-pipeline-upload-created
+      EventPattern:
+        source: [aws.s3]
+        detail-type: ['Object Created']
+        detail:
+          bucket:
+            name: [!Ref RawVideoBucket]
+          object:
+            key:
+              - prefix: uploads/
+      Targets:
+        - Id: PipelineStateMachine
+          Arn: !Ref PipelineStateMachine
+          RoleArn: !GetAtt EventBridgeStartExecutionRole.Arn
+          # State machine only needs the S3 event's `detail` (bucket/object) -
+          # trims the EventBridge envelope (source, account, region, etc.)
+          # before it becomes the execution input.
+          InputPath: $.detail
 
 Outputs:
   UploadFunctionUrl:
@@ -133,5 +244,11 @@ Outputs:
     Description: Name of the S3 bucket that receives raw uploads
     Value: !Ref RawVideoBucket
   OutputVideoBucketName:
-    Description: Name of the S3 bucket that receives transcoded 720p output
+    Description: Name of the S3 bucket that receives transcoded renditions
     Value: !Ref OutputVideoBucket
+  JobsTableName:
+    Description: Name of the DynamoDB table tracking transcode job status
+    Value: !Ref JobsTable
+  PipelineStateMachineArn:
+    Description: ARN of the Step Functions state machine that orchestrates each transcode job
+    Value: !Ref PipelineStateMachine
