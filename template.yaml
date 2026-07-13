@@ -1,11 +1,10 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  Video transcoding pipeline - Day 3: presigned-URL upload path (Day 1) feeds
-  a Step Functions state machine (Day 3) that probes each upload with ffprobe,
-  fans out to 1080p/720p/480p transcodes in parallel (skipping upscales), and
-  tracks job status in DynamoDB. Replaces Day 2's direct S3-to-Lambda trigger.
-  HLS output and CloudFront arrive in later days.
+  Video transcoding pipeline - Day 4: the Day 3 state machine now produces
+  HLS renditions (not bare MP4s), writes a master playlist, and serves
+  everything through a CloudFront distribution (Origin Access Control, no
+  public bucket access) so a browser can stream adaptively via hls.js.
 
 Globals:
   Function:
@@ -76,6 +75,15 @@ Resources:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: !Sub video-pipeline-output-${AWS::AccountId}
+      # Day 4: this bucket is fronted by CloudFront via Origin Access Control
+      # (see CloudFrontDistribution + OutputBucketPolicy below) - explicitly
+      # blocking all public access makes that the *only* way in, rather than
+      # relying on the absence of a public bucket policy to keep it private.
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
       LifecycleConfiguration:
         Rules:
           - Id: ExpireProcessedAfter7Days
@@ -148,6 +156,35 @@ Resources:
       DockerContext: ./src/worker
       DockerTag: latest
 
+  # Day 4: finalize step, runs once after the whole Map completes. Same
+  # image as Probe/Transcode (Command overridden to master.mjs) but needs
+  # neither ffmpeg/ffprobe nor much memory - it just formats a string and
+  # does one PutObject.
+  WriteMasterPlaylistFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: write-master-playlist
+      PackageType: Image
+      Architectures: [x86_64] # must match the shared image's platform, even though this handler never touches ffmpeg
+      MemorySize: 256
+      Timeout: 30
+      ImageConfig:
+        Command: ['master.handler']
+      Environment:
+        Variables:
+          OUTPUT_BUCKET: !Ref OutputVideoBucket
+      Policies:
+        # Write-only on the output bucket, scoped to processed/ - same
+        # constraint as TranscodeFunction, for the same reason.
+        - Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${OutputVideoBucket}/processed/*
+    Metadata:
+      Dockerfile: Dockerfile
+      DockerContext: ./src/worker
+      DockerTag: latest
+
   # Single-table job tracker. On-demand billing - free-tier friendly, no
   # capacity planning for a pipeline that runs on-demand per upload.
   JobsTable:
@@ -163,9 +200,9 @@ Resources:
           KeyType: HASH
 
   # State machine's own role, scoped to exactly what each state needs: invoke
-  # the two Lambdas by ARN, read/write only this table. No Lambda-based status
-  # writes - MarkJobStarted/MarkTranscoding/MarkCompleted/MarkFailed all use
-  # the direct dynamodb:putItem/updateItem SDK integration.
+  # the three Lambdas by ARN, read/write only this table. No Lambda-based
+  # status writes - MarkJobStarted/MarkTranscoding/MarkCompleted/MarkFailed
+  # all use the direct dynamodb:putItem/updateItem SDK integration.
   PipelineStateMachine:
     Type: AWS::Serverless::StateMachine
     Properties:
@@ -176,6 +213,12 @@ Resources:
         JobsTableName: !Ref JobsTable
         ProbeFunctionArn: !GetAtt ProbeFunction.Arn
         TranscodeFunctionArn: !GetAtt TranscodeFunction.Arn
+        WriteMasterPlaylistFunctionArn: !GetAtt WriteMasterPlaylistFunction.Arn
+        # Baked into MarkCompleted's cloudFrontUrl via States.Format - the
+        # domain is deploy-time-known (assigned by CloudFront), never
+        # runtime data, so a template substitution is the right layer for
+        # it rather than passing it through every state's payload.
+        CloudFrontDomainName: !GetAtt CloudFrontDistribution.DomainName
       Policies:
         - Statement:
             - Effect: Allow
@@ -183,6 +226,7 @@ Resources:
               Resource:
                 - !GetAtt ProbeFunction.Arn
                 - !GetAtt TranscodeFunction.Arn
+                - !GetAtt WriteMasterPlaylistFunction.Arn
         - Statement:
             - Effect: Allow
               Action:
@@ -236,6 +280,84 @@ Resources:
           # before it becomes the execution input.
           InputPath: $.detail
 
+  # Day 4: lets CloudFront read from OutputVideoBucket without the bucket
+  # ever granting public/anonymous access. OAC (not the older OAI) is the
+  # current AWS-recommended mechanism - it signs every origin request with
+  # SigV4 rather than relying on a special CloudFront-only IAM identity.
+  CloudFrontOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub video-pipeline-oac-${AWS::AccountId}
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # hls.js on localhost fetches playlists/segments cross-origin - without
+  # permissive CORS headers on the CloudFront response, the browser blocks
+  # every segment fetch even though the GET itself succeeds at the origin.
+  HlsCorsResponseHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub video-pipeline-hls-cors-${AWS::AccountId}
+        CorsConfig:
+          AccessControlAllowOrigins:
+            Items: ['*']
+          AccessControlAllowMethods:
+            Items: [GET, HEAD]
+          AccessControlAllowHeaders:
+            Items: ['*']
+          AccessControlAllowCredentials: false
+          OriginOverride: true
+
+  # Fronts OutputVideoBucket - the bucket itself stays fully private
+  # (PublicAccessBlockConfiguration above); this is the only path in.
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        PriceClass: PriceClass_100 # cheapest tier (NA/EU edge locations only) - fine for a demo, not a global audience
+        Origins:
+          - Id: OutputBucketOrigin
+            DomainName: !GetAtt OutputVideoBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt CloudFrontOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: '' # empty on purpose - OAC replaces the legacy OAI mechanism this field was built for
+        DefaultCacheBehavior:
+          TargetOriginId: OutputBucketOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          # Managed-CachingOptimized: long default/max TTL, respects any
+          # Cache-Control the origin sends. Playlists and segments are
+          # immutable once written (VOD, not live) so this is fine for both -
+          # see README gotchas for the nuance if this ever becomes a live
+          # pipeline where playlists mutate.
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          ResponseHeadersPolicyId: !Ref HlsCorsResponseHeadersPolicy
+
+  # Grants cloudfront.amazonaws.com read access, scoped to exactly this
+  # distribution via the SourceArn condition - a different distribution
+  # (even in the same account) can't use this policy to read the bucket.
+  OutputBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref OutputVideoBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${OutputVideoBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}
+
 Outputs:
   UploadFunctionUrl:
     Description: Public URL for the get-upload-url Lambda
@@ -252,3 +374,6 @@ Outputs:
   PipelineStateMachineArn:
     Description: ARN of the Step Functions state machine that orchestrates each transcode job
     Value: !Ref PipelineStateMachine
+  CloudFrontDomainName:
+    Description: CloudFront distribution domain that serves processed/* (HLS playlists + segments) - inject into frontend/watch.html
+    Value: !GetAtt CloudFrontDistribution.DomainName

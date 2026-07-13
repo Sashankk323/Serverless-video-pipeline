@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Video Watch — Day 4</title>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 3rem auto; padding: 0 1rem; color: #1a1a1a; }
+  h1 { font-size: 1.25rem; }
+  .row { display: flex; gap: 0.5rem; margin: 1rem 0; }
+  input { flex: 1; padding: 0.5rem; font-size: 0.9rem; }
+  button { padding: 0.5rem 1rem; cursor: pointer; }
+  video { width: 100%; background: #000; margin-top: 1rem; }
+  #status { font-size: 0.85rem; color: #444; white-space: pre-wrap; margin-top: 0.5rem; }
+  #quality { font-size: 0.85rem; color: #2563eb; font-weight: 600; margin-top: 0.25rem; }
+</style>
+</head>
+<body>
+  <h1>Watch a transcoded video</h1>
+  <div class="row">
+    <input type="text" id="job-input" placeholder="jobId, or full master.m3u8 URL" />
+    <button id="load-btn">Load</button>
+  </div>
+  <video id="video" controls></video>
+  <div id="quality"></div>
+  <div id="status">Enter a jobId to begin.</div>
+
+<script>
+  // Injected after `sam deploy` by reading the stack's CloudFrontDomainName output.
+  const CLOUDFRONT_DOMAIN = "d36eu3hq6yl4xo.cloudfront.net";
+
+  const jobInput = document.getElementById('job-input');
+  const loadBtn = document.getElementById('load-btn');
+  const video = document.getElementById('video');
+  const statusEl = document.getElementById('status');
+  const qualityEl = document.getElementById('quality');
+
+  function setStatus(msg) {
+    statusEl.textContent = msg;
+  }
+
+  function resolveMasterUrl(input) {
+    if (input.startsWith('http://') || input.startsWith('https://')) {
+      return input;
+    }
+    return `https://${CLOUDFRONT_DOMAIN}/processed/${input}/master.m3u8`;
+  }
+
+  let hls = null;
+
+  loadBtn.addEventListener('click', () => {
+    const raw = jobInput.value.trim();
+    if (!raw) {
+      setStatus('Enter a jobId or a master.m3u8 URL first.');
+      return;
+    }
+
+    const masterUrl = resolveMasterUrl(raw);
+    setStatus(`Loading ${masterUrl} ...`);
+    qualityEl.textContent = '';
+
+    if (hls) {
+      hls.destroy();
+      hls = null;
+    }
+
+    if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      // Safari has native HLS support - no hls.js needed, and hls.js
+      // deliberately refuses to attach when native support is present.
+      video.src = masterUrl;
+      video.addEventListener('loadedmetadata', () => {
+        setStatus(`Playing via native HLS (Safari). ${masterUrl}`);
+        video.play();
+      }, { once: true });
+      video.addEventListener('error', () => {
+        setStatus(`Native playback error - check the URL and CORS.`);
+      }, { once: true });
+      return;
+    }
+
+    if (!window.Hls || !Hls.isSupported()) {
+      setStatus('Neither native HLS nor hls.js is supported in this browser.');
+      return;
+    }
+
+    hls = new Hls();
+    hls.loadSource(masterUrl);
+    hls.attachMedia(video);
+
+    hls.on(Hls.Events.MANIFEST_PARSED, (event, data) => {
+      const levels = data.levels.map((l) => `${l.height}p@${Math.round(l.bitrate / 1000)}kbps`).join(', ');
+      setStatus(`Manifest loaded via hls.js. Levels: ${levels}`);
+      video.play();
+    });
+
+    hls.on(Hls.Events.LEVEL_SWITCHED, (event, data) => {
+      const level = hls.levels[data.level];
+      qualityEl.textContent = `Now playing: ${level.height}p (${Math.round(level.bitrate / 1000)} kbps)`;
+    });
+
+    hls.on(Hls.Events.ERROR, (event, data) => {
+      if (data.fatal) {
+        setStatus(`Fatal hls.js error: ${data.type} - ${data.details}`);
+      }
+    });
+  });
+</script>
+</body>
+</html>

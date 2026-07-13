@@ -311,6 +311,10 @@ aws logs tail /aws/lambda/transcode-video --since 10m
   static ffmpeg `.tar.xz` archive failed with `tar: command not found` until
   the Dockerfile installed both via `dnf` first.
 
+### Day 4 additions
+
+- **CORS is wide open (`*`) on the CloudFront response headers policy** — fine for this demo's `watch.html` running off `localhost`, tighten to the real frontend origin once one exists.
+
 ### Day 3 additions
 
 - **Removing the double-trigger footgun** — the whole point of Day 3's deploy

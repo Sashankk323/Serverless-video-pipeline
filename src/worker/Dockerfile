@@ -23,10 +23,11 @@ RUN curl -sL https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-stat
 COPY package.json ${LAMBDA_TASK_ROOT}/
 RUN npm install --omit=dev --prefix ${LAMBDA_TASK_ROOT}
 
-# One image, two handlers - probe.mjs (ffprobe) and transcode.mjs (ffmpeg).
-# Which one runs is chosen per-Lambda-resource via ImageConfig.Command in
-# template.yaml, not by building two images.
-COPY probe.mjs transcode.mjs ${LAMBDA_TASK_ROOT}/
+# One image, three handlers - probe.mjs (ffprobe), transcode.mjs (ffmpeg, now
+# HLS output), and master.mjs (writes the master playlist, no ffmpeg/ffprobe
+# involved at all). Which one runs is chosen per-Lambda-resource via
+# ImageConfig.Command in template.yaml, not by building separate images.
+COPY probe.mjs transcode.mjs master.mjs ${LAMBDA_TASK_ROOT}/
 
 # Default only - ProbeFunction overrides this via ImageConfig.Command.
 CMD ["transcode.handler"]

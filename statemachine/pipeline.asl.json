@@ -1,5 +1,5 @@
 {
-  "Comment": "Probe a raw upload, fan out to 1080p/720p/480p transcodes (skipping upscales), track status in DynamoDB.",
+  "Comment": "Probe a raw upload, fan out to 1080p/720p/480p HLS renditions (skipping upscales), write a master playlist, track status in DynamoDB.",
   "StartAt": "PrepareJob",
   "States": {
     "PrepareJob": {
@@ -100,7 +100,8 @@
                 "key.$": "$.sourceKey",
                 "jobId.$": "$.jobId",
                 "height.$": "$$.Map.Item.Value.height",
-                "outputKey.$": "States.Format('processed/{}/{}p.mp4', $.jobId, $$.Map.Item.Value.height)"
+                "duration.$": "$.probe.duration",
+                "outputKey.$": "States.Format('processed/{}/{}p', $.jobId, $$.Map.Item.Value.height)"
               },
               "ItemProcessor": {
                 "ProcessorConfig": { "Mode": "INLINE" },
@@ -115,8 +116,9 @@
                     },
                     "ResultSelector": {
                       "height.$": "$.Payload.height",
-                      "outputKey.$": "$.Payload.outputKey",
-                      "transcodeMs.$": "$.Payload.transcodeMs"
+                      "width.$": "$.Payload.width",
+                      "bandwidth.$": "$.Payload.bandwidth",
+                      "playlistKey.$": "$.Payload.playlistKey"
                     },
                     "Retry": [
                       {
@@ -136,6 +138,35 @@
                 }
               },
               "ResultPath": "$.transcodeResults",
+              "Next": "WriteMasterPlaylist"
+            },
+            "WriteMasterPlaylist": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${WriteMasterPlaylistFunctionArn}",
+                "Payload": {
+                  "jobId.$": "$.jobId",
+                  "renditions.$": "$.transcodeResults"
+                }
+              },
+              "ResultSelector": {
+                "masterKey.$": "$.Payload.masterKey"
+              },
+              "ResultPath": "$.master",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.AWSLambdaException",
+                    "Lambda.SdkClientException",
+                    "Lambda.TooManyRequestsException"
+                  ],
+                  "IntervalSeconds": 2,
+                  "BackoffRate": 2,
+                  "MaxAttempts": 2
+                }
+              ],
               "Next": "MarkCompleted"
             },
             "MarkCompleted": {
@@ -146,14 +177,16 @@
                 "Key": {
                   "jobId": { "S.$": "$.jobId" }
                 },
-                "UpdateExpression": "SET #status = :status, updatedAt = :now, renditions = :renditions",
+                "UpdateExpression": "SET #status = :status, updatedAt = :now, renditions = :renditions, masterPlaylistKey = :masterKey, cloudFrontUrl = :cfUrl",
                 "ExpressionAttributeNames": {
                   "#status": "status"
                 },
                 "ExpressionAttributeValues": {
                   ":status": { "S": "COMPLETED" },
                   ":now": { "S.$": "$$.State.EnteredTime" },
-                  ":renditions": { "S.$": "States.JsonToString($.transcodeResults)" }
+                  ":renditions": { "S.$": "States.JsonToString($.transcodeResults)" },
+                  ":masterKey": { "S.$": "$.master.masterKey" },
+                  ":cfUrl": { "S.$": "States.Format('https://${CloudFrontDomainName}/{}', $.master.masterKey)" }
                 }
               },
               "ResultPath": null,
